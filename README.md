@@ -9,3 +9,8 @@ A held key is released after 10 seconds without another report. Use `--key-timeo
 Run the simulated behavior tests with `python3 -m unittest discover -s tests -v`. Hardware-specific UUID selection and Bluetooth reconnection should also be verified with the actual remote.
 
 The extra buttons assume the reported codes are YouTube (`0x0077`), Netflix (`0x0078`), power (`0x019e`), and source (`0x0189`), respectively. YouTube and Netflix open their websites using `xdg-open`; when started through sudo they run as the invoking user. The power button sends the desktop's screen-lock key, and source sends the display-mode-switch key. The desktop environment must support those keys; switching the computer's display mode does not change a monitor's physical input. Opening websites requires a graphical user session and `xdg-open`.
+
+To experimentally stop G9N9N ATVV 1.0 voice sessions as soon as the assistant button starts one, run `sudo python g9n9n-bridge.py --cancel-voice`. This disables the remote's voice audio while enabled and may reduce delays to other buttons; improvement has not yet been verified on hardware. The bridge discovers the ATVV service by UUID, subscribes to control notifications, and sends MIC_CLOSE with the reported stream ID. It does not implement microphone audio, speech recognition, or an assistant. Do not use this option alongside software using the remote's microphone. ATVV message layout was checked against [ATVVoice](https://github.com/b0o/ATVVoice/blob/main/src/protocol/v10.rs).
+
+
+The experimental assistant + volume Page Up/Down mapping is disabled because the remote can buffer normal key reports during the voice session.

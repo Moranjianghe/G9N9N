@@ -20,6 +20,9 @@ CHAR = "org.bluez.GattCharacteristic1"
 DEFAULT_ADDRESS = "FF:32:3A:75:83:0D"
 HID_UUID = "00001812-0000-1000-8000-00805f9b34fb"
 REPORT_UUID = "00002a4d-0000-1000-8000-00805f9b34fb"
+ATVV_SERVICE = "ab5e0001-5a21-4f05-bc7d-af01f617b664"
+ATVV_TX = "ab5e0002-5a21-4f05-bc7d-af01f617b664"
+ATVV_CTL = "ab5e0004-5a21-4f05-bc7d-af01f617b664"
 KEYS = {
     0x0041: e.KEY_ENTER, 0x0042: e.KEY_UP, 0x0043: e.KEY_DOWN,
     0x0044: e.KEY_LEFT, 0x0045: e.KEY_RIGHT, 0x00E2: e.KEY_MUTE,
@@ -27,6 +30,8 @@ KEYS = {
     0x00CD: e.KEY_PLAYPAUSE, 0x0224: e.KEY_ESC, 0x0223: e.KEY_LEFTMETA,
     0x019E: e.KEY_COFFEE, 0x0189: e.KEY_SWITCHVIDEOMODE,
 }
+# Disabled: the remote buffers volume reports while the assistant key is held.
+# COMBO_KEYS = {0x00E9: e.KEY_PAGEUP, 0x00EA: e.KEY_PAGEDOWN}
 URLS = {0x0077: "https://www.youtube.com/", 0x0078: "https://www.netflix.com/"}
 LOG = logging.getLogger("g9n9n")
 
@@ -58,6 +63,7 @@ def parse_args(argv=None):
     parser.add_argument("--characteristic-path", help="Select a specific characteristic when UUIDs are ambiguous")
     parser.add_argument("--key-timeout", type=float, default=10.0,
                         help="Release a held key after this many seconds without a report (0 disables; default: 10)")
+    parser.add_argument("--cancel-voice", action="store_true", help="Experimentally stop ATVV voice sessions to reduce button delays; disables voice")
     parser.add_argument("--log-level", choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], default='INFO')
     args = parser.parse_args(argv)
     if not 0 <= args.key_timeout < float('inf'):
@@ -70,7 +76,11 @@ class Bridge:
         self.bus, self.ui, self.args, self.clock = bus, ui, args, clock
         self.device_path = self.char_path = None
         self.char = None
+        self.voice_ctl_path = self.voice_ctl = self.voice_tx = None
         self.pressed = 0
+        self.pressed_key = None
+        self.assistant_held = False
+        self.assistant_deadline = None
         self.deadline = None
         self.pending = False
         self.generation = 0
@@ -79,19 +89,23 @@ class Bridge:
         self.matches = []
 
     def release(self):
-        key = KEYS.get(self.pressed)
+        key = self.pressed_key
         if key is not None:
             self.ui.write(e.EV_KEY, key, 0)
             self.ui.syn()
         self.pressed = 0
+        self.pressed_key = None
         self.deadline = None
 
     def reset(self, reason):
         LOG.info('%s', reason)
         self.release()
+        self.assistant_held = False
+        self.assistant_deadline = None
         self.generation += 1
         self.pending = False
         self.device_path = self.char_path = self.char = None
+        self.voice_ctl_path = self.voice_ctl = self.voice_tx = None
         self.retry_at = self.clock()
         self.retry_delay = 1
 
@@ -105,6 +119,10 @@ class Bridge:
 
     def tick(self):
         now = self.clock()
+        if self.assistant_deadline is not None and now >= self.assistant_deadline:
+            LOG.warning('Assistant modifier timed out')
+            self.assistant_held = False
+            self.assistant_deadline = None
         if self.deadline is not None and now >= self.deadline:
             LOG.warning('Key release timed out')
             self.release()
@@ -167,12 +185,65 @@ class Bridge:
             if len(chars) != 1:
                 raise ValueError(f'Expected one matching notification characteristic, found {len(chars)} ({", ".join(chars)}); use --characteristic-path to select one')
             self.char_path = chars[0]
+            if self.args.cancel_voice and not self.voice_ctl_path:
+                self.setup_voice(objects, device_path, generation)
             char = dbus.Interface(self.bus.get_object(BLUEZ, self.char_path), CHAR)
             self.pending = True
             char.StartNotify(reply_handler=lambda: self.subscribed(char, generation),
                              error_handler=lambda exc: self.failed(exc, generation))
         except (dbus.DBusException, ValueError) as exc:
             self.failed(exc, generation)
+
+    def setup_voice(self, objects, device_path, generation):
+        services = {str(path) for path, interfaces in objects.items()
+                    if SERVICE in interfaces and str(interfaces[SERVICE].get('Device', '')) == device_path
+                    and str(interfaces[SERVICE].get('UUID', '')).lower() == ATVV_SERVICE}
+        chars = {str(props.get('UUID', '')).lower(): str(path)
+                 for path, interfaces in objects.items()
+                 for props in [interfaces.get(CHAR, {})]
+                 if str(props.get('Service', '')) in services}
+        if ATVV_CTL not in chars or ATVV_TX not in chars:
+            LOG.warning('ATVV control characteristic unavailable; assistant combinations disabled')
+            return
+        try:
+            self.voice_ctl_path = chars[ATVV_CTL]
+            ctl = dbus.Interface(self.bus.get_object(BLUEZ, self.voice_ctl_path), CHAR)
+            self.voice_tx = dbus.Interface(self.bus.get_object(BLUEZ, chars[ATVV_TX]), CHAR)
+            ctl.StartNotify(reply_handler=lambda: self.voice_subscribed(ctl, generation),
+                            error_handler=lambda exc: self.voice_subscribe_failed(exc, generation))
+        except dbus.DBusException as exc:
+            LOG.warning('ATVV setup failed: %s', exc)
+            self.voice_ctl_path = self.voice_tx = None
+
+    def voice_subscribe_failed(self, exc, generation):
+        if generation == self.generation:
+            self.voice_ctl_path = self.voice_tx = None
+            LOG.warning('ATVV subscription failed: %s', exc)
+
+    def voice_subscribed(self, ctl, generation):
+        if generation == self.generation:
+            self.voice_ctl = ctl
+            LOG.info('ATVV voice cancellation enabled (voice audio will be stopped)')
+
+    def voice_notification(self, data):
+        if len(data) == 4 and data[0] == 4 and data[1] == 3 and data[2] in (1, 2) and 1 <= data[3] <= 0x80:
+            self.assistant_held = True
+            self.assistant_deadline = self.clock() + 10
+            LOG.debug('Assistant modifier pressed')
+        elif len(data) >= 2 and data[0] == 0:
+            self.assistant_held = False
+            self.assistant_deadline = None
+            LOG.debug('Assistant modifier released (reason %02x)', data[1])
+        if self.args.cancel_voice and len(data) == 4 and data[0] == 4 and data[1] in (1, 3) and data[2] in (1, 2) and 1 <= data[3] <= 0x80 and self.voice_tx:
+            stream_id = data[3]
+            LOG.info('Stopping ATVV voice stream %d', stream_id)
+            try:
+                self.voice_tx.WriteValue(dbus.ByteArray(bytes([0x0d, stream_id])),
+                                         {'type': 'command'},
+                                         reply_handler=lambda: None,
+                                         error_handler=lambda exc: LOG.warning('ATVV close failed: %s', exc))
+            except dbus.DBusException as exc:
+                LOG.warning('ATVV close failed: %s', exc)
 
     def connected(self, generation):
         if generation == self.generation:
@@ -189,7 +260,9 @@ class Bridge:
 
     def properties_changed(self, interface, props, invalidated, path=None):
         path = str(path)
-        if path == self.device_path and interface == DEVICE:
+        if path == self.voice_ctl_path and interface == CHAR and self.voice_ctl and 'Value' in props:
+            self.voice_notification(bytes(props['Value']))
+        elif path == self.device_path and interface == DEVICE:
             for name in ('Connected', 'ServicesResolved'):
                 if name in props:
                     LOG.debug('Device %s = %s', name, bool(props[name]))
@@ -215,7 +288,9 @@ class Bridge:
                 return
             self.release()
             self.pressed = code
+            # key = COMBO_KEYS.get(code, KEYS.get(code)) if self.assistant_held else KEYS.get(code)
             key = KEYS.get(code)
+            self.pressed_key = key
             if key is not None:
                 self.ui.write(e.EV_KEY, key, 1)
                 self.ui.syn()
@@ -245,6 +320,11 @@ class Bridge:
 
     def close(self):
         self.release()
+        if self.voice_ctl:
+            try:
+                self.voice_ctl.StopNotify()
+            except dbus.DBusException as exc:
+                LOG.warning('ATVV StopNotify: %s', exc)
         if self.char:
             try:
                 self.char.StopNotify()

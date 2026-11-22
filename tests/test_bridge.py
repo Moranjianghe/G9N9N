@@ -9,6 +9,7 @@ from unittest.mock import patch
 dbus = types.ModuleType('dbus')
 dbus.DBusException = type('DBusException', (Exception,), {})
 dbus.Interface = lambda obj, interface: obj
+dbus.ByteArray = bytes
 mainloop = types.ModuleType('dbus.mainloop')
 glib = types.ModuleType('dbus.mainloop.glib')
 glib.DBusGMainLoop = lambda **kwargs: None
@@ -16,7 +17,7 @@ gi = types.ModuleType('gi')
 repository = types.ModuleType('gi.repository')
 repository.GLib = types.SimpleNamespace()
 evdev = types.ModuleType('evdev')
-key_names = ['KEY_ENTER', 'KEY_UP', 'KEY_DOWN', 'KEY_LEFT', 'KEY_RIGHT', 'KEY_MUTE', 'KEY_VOLUMEUP', 'KEY_VOLUMEDOWN', 'KEY_PLAYPAUSE', 'KEY_ESC', 'KEY_LEFTMETA', 'KEY_COFFEE', 'KEY_SWITCHVIDEOMODE']
+key_names = ['KEY_ENTER', 'KEY_UP', 'KEY_DOWN', 'KEY_LEFT', 'KEY_RIGHT', 'KEY_MUTE', 'KEY_VOLUMEUP', 'KEY_VOLUMEDOWN', 'KEY_PLAYPAUSE', 'KEY_ESC', 'KEY_LEFTMETA', 'KEY_COFFEE', 'KEY_SWITCHVIDEOMODE', 'KEY_PAGEUP', 'KEY_PAGEDOWN']
 codes = types.SimpleNamespace(EV_KEY=1, KEY={i: name for i, name in enumerate(key_names, 1)}, **{name: i for i, name in enumerate(key_names, 1)})
 evdev.ecodes = codes
 evdev.UInput = object
@@ -82,6 +83,39 @@ class BridgeTests(unittest.TestCase):
         self.now = 19; self.b.tick(); self.assertEqual(self.values(), [1, 0])
         self.value([0x41, 0]); self.b.args.key_timeout = 0; self.b.deadline = None; self.now = 100; self.b.tick()
         self.assertEqual(self.values(), [1, 0, 1])
+
+    def test_voice_close_only_for_valid_button_streams(self):
+        sent = []
+        self.b.args.cancel_voice = True
+        self.b.voice_tx = types.SimpleNamespace(WriteValue=lambda data, options, **kw: sent.append((bytes(data), options)))
+        self.b.voice_notification(bytes.fromhex('04 03 02 12'))
+        self.b.voice_notification(bytes.fromhex('00 02'))
+        self.b.voice_notification(bytes.fromhex('04 03 02'))
+        self.b.voice_notification(bytes.fromhex('04 00 02 12'))
+        self.assertEqual(sent, [(bytes.fromhex('0d 12'), {'type': 'command'})])
+
+    def test_assistant_does_not_change_volume_keys(self):
+        self.b.voice_notification(bytes.fromhex('04 03 02 12'))
+        self.value([0xe9, 0]); self.value([0, 0])
+        self.value([0xea, 0]); self.value([0, 0])
+        self.assertEqual(self.ui.events, [
+            (codes.EV_KEY, codes.KEY_VOLUMEUP, 1), (codes.EV_KEY, codes.KEY_VOLUMEUP, 0),
+            (codes.EV_KEY, codes.KEY_VOLUMEDOWN, 1), (codes.EV_KEY, codes.KEY_VOLUMEDOWN, 0)])
+
+    def test_voice_discovery_and_disconnect(self):
+        self.b.reset('test')
+        self.b.args.cancel_voice = True
+        self.bus.objects.update({
+            '/voice': {bridge.SERVICE: {'Device': '/dev', 'UUID': bridge.ATVV_SERVICE}},
+            '/voice/ctl': {bridge.CHAR: {'Service': '/voice', 'UUID': bridge.ATVV_CTL}},
+            '/voice/tx': {bridge.CHAR: {'Service': '/voice', 'UUID': bridge.ATVV_TX}},
+        })
+        self.b.tick()
+        self.assertEqual(self.b.voice_ctl_path, '/voice/ctl')
+        self.assertIsNotNone(self.b.voice_ctl)
+        self.b.properties_changed(bridge.DEVICE, {'Connected': False}, [], path='/dev')
+        self.assertIsNone(self.b.voice_ctl)
+        self.assertIsNone(self.b.voice_tx)
 
     def test_stopped_notifications_release_and_resubscribe(self):
         self.value([0x41, 0])
