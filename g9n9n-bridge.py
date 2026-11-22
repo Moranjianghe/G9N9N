@@ -2,6 +2,9 @@
 """Bridge a BlueZ GATT consumer report to a virtual keyboard."""
 import argparse
 import logging
+import os
+import pwd
+import subprocess
 import signal
 import time
 
@@ -22,13 +25,34 @@ KEYS = {
     0x0044: e.KEY_LEFT, 0x0045: e.KEY_RIGHT, 0x00E2: e.KEY_MUTE,
     0x00E9: e.KEY_VOLUMEUP, 0x00EA: e.KEY_VOLUMEDOWN,
     0x00CD: e.KEY_PLAYPAUSE, 0x0224: e.KEY_ESC, 0x0223: e.KEY_LEFTMETA,
+    0x019E: e.KEY_COFFEE, 0x0189: e.KEY_SWITCHVIDEOMODE,
 }
+URLS = {0x0077: "https://www.youtube.com/", 0x0078: "https://www.netflix.com/"}
 LOG = logging.getLogger("g9n9n")
+
+
+def open_url(url):
+    """Open the URL as the invoking desktop user when started with sudo."""
+    env = os.environ.copy()
+    options = {}
+    if os.geteuid() == 0 and env.get("SUDO_UID"):
+        user = pwd.getpwuid(int(env["SUDO_UID"]))
+        env.update(HOME=user.pw_dir, USER=user.pw_name, LOGNAME=user.pw_name)
+        runtime = f"/run/user/{user.pw_uid}"
+        env.setdefault("XDG_RUNTIME_DIR", runtime)
+        env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={runtime}/bus")
+        options.update(user=user.pw_uid, group=user.pw_gid,
+                       extra_groups=os.getgrouplist(user.pw_name, user.pw_gid), cwd=user.pw_dir)
+    try:
+        subprocess.Popen(["xdg-open", url], env=env, **options)
+    except (OSError, ValueError) as exc:
+        LOG.error("Cannot open %s: %s", url, exc)
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--address", default=DEFAULT_ADDRESS, help="Bluetooth address")
+    parser.add_argument("--address", help="Bluetooth address (otherwise discover by name)")
+    parser.add_argument("--name", default="G9N9N", help="Bluetooth device name (default: G9N9N)")
     parser.add_argument("--service-uuid", default=HID_UUID)
     parser.add_argument("--characteristic-uuid", default=REPORT_UUID)
     parser.add_argument("--characteristic-path", help="Select a specific characteristic when UUIDs are ambiguous")
@@ -104,9 +128,18 @@ class Bridge:
         self.pending = False
         try:
             devices = [(str(p), interfaces[DEVICE]) for p, interfaces in objects.items()
-                       if DEVICE in interfaces and str(interfaces[DEVICE].get('Address', '')).upper() == self.args.address.upper()]
+                       if DEVICE in interfaces and (
+                           str(interfaces[DEVICE].get('Address', '')).upper() == self.args.address.upper()
+                           if self.args.address else
+                           self.args.name.casefold() in (str(interfaces[DEVICE].get('Name', '')).casefold(),
+                                                        str(interfaces[DEVICE].get('Alias', '')).casefold()))]
+            if not devices and not self.args.address and self.args.name == 'G9N9N':
+                devices = [(str(p), interfaces[DEVICE]) for p, interfaces in objects.items()
+                           if DEVICE in interfaces and str(interfaces[DEVICE].get('Address', '')).upper() == DEFAULT_ADDRESS]
+                if devices:
+                    LOG.info('Found known remote by address (device name did not match)')
             if len(devices) != 1:
-                raise ValueError(f'Expected one device for {self.args.address}, found {len(devices)}')
+                raise ValueError(f'Expected one device for {self.args.address or self.args.name}, found {len(devices)}; pair it first or use --address')
             device_path, device = devices[0]
             self.device_path = device_path
             if not device.get('Connected', False):
@@ -126,6 +159,11 @@ class Bridge:
                      and ('notify' in interfaces[CHAR].get('Flags', []) or 'indicate' in interfaces[CHAR].get('Flags', []))]
             if self.args.characteristic_path:
                 chars = [p for p in chars if p == self.args.characteristic_path]
+            elif len(chars) > 1 and str(device.get('Address', '')).upper() == DEFAULT_ADDRESS:
+                # This report was used by the original bridge for this specific device.
+                known = device_path + '/service0023/char002a'
+                if known in chars:
+                    chars = [known]
             if len(chars) != 1:
                 raise ValueError(f'Expected one matching notification characteristic, found {len(chars)} ({", ".join(chars)}); use --characteristic-path to select one')
             self.char_path = chars[0]
@@ -156,12 +194,13 @@ class Bridge:
                 self.reset('Device disconnected or services lost')
         elif path == self.char_path and interface == CHAR and self.char and 'Value' in props:
             raw = bytes(props['Value'])
+            LOG.debug('Notification from %s: %s', path, raw.hex(' '))
             if len(raw) < 2:
                 LOG.warning('Ignoring short notification: %s', raw.hex(' '))
                 return
             code = int.from_bytes(raw[:2], 'little')
             if code == self.pressed:
-                if code in KEYS and self.args.key_timeout:
+                if code in (*KEYS, *URLS) and self.args.key_timeout:
                     self.deadline = self.clock() + self.args.key_timeout
                 return
             self.release()
@@ -173,6 +212,11 @@ class Bridge:
                 if self.args.key_timeout:
                     self.deadline = self.clock() + self.args.key_timeout
                 LOG.info('0x%04x -> %s', code, e.KEY[key])
+            elif code in URLS:
+                if self.args.key_timeout:
+                    self.deadline = self.clock() + self.args.key_timeout
+                LOG.info('Opening %s', URLS[code])
+                open_url(URLS[code])
             elif code:
                 LOG.warning('Unmapped: 0x%04x', code)
 
@@ -214,7 +258,7 @@ def main(argv=None):
         signal.signal(signal.SIGINT, lambda *_: loop.quit())
         signal.signal(signal.SIGTERM, lambda *_: loop.quit())
         GLib.timeout_add(250, bridge.tick)
-        LOG.info('Waiting for %s', args.address)
+        LOG.info('Waiting for %s', args.address or args.name)
         loop.run()
     finally:
         bridge.close()

@@ -16,7 +16,7 @@ gi = types.ModuleType('gi')
 repository = types.ModuleType('gi.repository')
 repository.GLib = types.SimpleNamespace()
 evdev = types.ModuleType('evdev')
-key_names = ['KEY_ENTER', 'KEY_UP', 'KEY_DOWN', 'KEY_LEFT', 'KEY_RIGHT', 'KEY_MUTE', 'KEY_VOLUMEUP', 'KEY_VOLUMEDOWN', 'KEY_PLAYPAUSE', 'KEY_ESC', 'KEY_LEFTMETA']
+key_names = ['KEY_ENTER', 'KEY_UP', 'KEY_DOWN', 'KEY_LEFT', 'KEY_RIGHT', 'KEY_MUTE', 'KEY_VOLUMEUP', 'KEY_VOLUMEDOWN', 'KEY_PLAYPAUSE', 'KEY_ESC', 'KEY_LEFTMETA', 'KEY_COFFEE', 'KEY_SWITCHVIDEOMODE']
 codes = types.SimpleNamespace(EV_KEY=1, KEY={i: name for i, name in enumerate(key_names, 1)}, **{name: i for i, name in enumerate(key_names, 1)})
 evdev.ecodes = codes
 evdev.UInput = object
@@ -44,7 +44,7 @@ class Bus:
 
 
 def objects(connected=True, resolved=True):
-    return {'/dev': {bridge.DEVICE: {'Address': bridge.DEFAULT_ADDRESS, 'Connected': connected, 'ServicesResolved': resolved}},
+    return {'/dev': {bridge.DEVICE: {'Address': bridge.DEFAULT_ADDRESS, 'Name': 'G9N9N', 'Connected': connected, 'ServicesResolved': resolved}},
             '/svc': {bridge.SERVICE: {'Device': '/dev', 'UUID': bridge.HID_UUID}},
             '/char': {bridge.CHAR: {'Service': '/svc', 'UUID': bridge.REPORT_UUID, 'Flags': ['notify']}}}
 
@@ -98,10 +98,40 @@ class BridgeTests(unittest.TestCase):
         self.b.args.characteristic_path = '/char'; self.now = self.b.retry_at; self.b.tick()
         self.assertEqual(self.b.char_path, '/char')
 
+    def test_known_device_automatically_selects_original_report(self):
+        self.b.reset('test')
+        self.bus.objects['/dev/service0023/char002a'] = self.bus.objects['/char']
+        self.b.tick()
+        self.assertEqual(self.b.char_path, '/dev/service0023/char002a')
+
+    def test_name_and_address_selection(self):
+        self.b.reset('test')
+        self.bus.objects['/dev'][bridge.DEVICE]['Name'] = 'Other'
+        self.bus.objects['/dev'][bridge.DEVICE]['Address'] = 'AA:BB:CC:DD:EE:FF'
+        self.b.tick()
+        self.assertIsNone(self.b.char)
+        self.b.args.address = 'AA:BB:CC:DD:EE:FF'
+        self.now = self.b.retry_at
+        self.b.tick()
+        self.assertEqual(self.b.char_path, '/char')
+
     def test_retry_backoff(self):
         self.b.reset('test'); self.bus.objects = {}
         self.b.tick(); self.assertEqual(self.b.retry_at, 1)
         self.now = 1; self.b.tick(); self.assertEqual(self.b.retry_at, 3)
+
+    def test_extra_buttons(self):
+        with patch.object(bridge, 'open_url') as open_url:
+            self.value([0x77, 0]); self.value([0x77, 0]); self.value([0, 0])
+            self.value([0x78, 0]); self.value([0, 0])
+            self.assertEqual([call.args[0] for call in open_url.call_args_list],
+                             ['https://www.youtube.com/', 'https://www.netflix.com/'])
+        self.value([0x9e, 0x01]); self.value([0, 0])
+        self.value([0x89, 0x01]); self.value([0, 0])
+        self.assertEqual(self.ui.events, [(codes.EV_KEY, codes.KEY_COFFEE, 1),
+                                          (codes.EV_KEY, codes.KEY_COFFEE, 0),
+                                          (codes.EV_KEY, codes.KEY_SWITCHVIDEOMODE, 1),
+                                          (codes.EV_KEY, codes.KEY_SWITCHVIDEOMODE, 0)])
 
     def test_removal_and_unmapped(self):
         self.value([0xff, 0xff]); self.assertEqual(self.values(), [])
