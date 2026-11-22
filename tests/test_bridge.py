@@ -83,6 +83,16 @@ class BridgeTests(unittest.TestCase):
         self.value([0x41, 0]); self.b.args.key_timeout = 0; self.b.deadline = None; self.now = 100; self.b.tick()
         self.assertEqual(self.values(), [1, 0, 1])
 
+    def test_stopped_notifications_release_and_resubscribe(self):
+        self.value([0x41, 0])
+        self.b.properties_changed(bridge.CHAR, {'Notifying': False}, [], path='/char')
+        self.assertEqual(self.values(), [1, 0])
+        self.assertIsNone(self.b.char)
+        self.b.tick()
+        self.assertEqual(self.bus.calls.count('notify'), 2)
+        self.value([0x41, 0])
+        self.assertEqual(self.values(), [1, 0, 1])
+
     def test_restart_and_stale_callback(self):
         self.value([0x41, 0]); generation = self.b.generation
         self.b.owner_changed(bridge.BLUEZ, ':1', ':2')

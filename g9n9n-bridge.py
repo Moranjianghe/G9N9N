@@ -190,9 +190,19 @@ class Bridge:
     def properties_changed(self, interface, props, invalidated, path=None):
         path = str(path)
         if path == self.device_path and interface == DEVICE:
+            for name in ('Connected', 'ServicesResolved'):
+                if name in props:
+                    LOG.debug('Device %s = %s', name, bool(props[name]))
             if ('Connected' in props and not props['Connected']) or ('ServicesResolved' in props and not props['ServicesResolved'] and self.char):
                 self.reset('Device disconnected or services lost')
-        elif path == self.char_path and interface == CHAR and self.char and 'Value' in props:
+        elif path == self.char_path and interface == CHAR and self.char:
+            if 'Notifying' in props:
+                LOG.debug('Characteristic Notifying = %s', bool(props['Notifying']))
+                if not props['Notifying']:
+                    self.reset('Notifications stopped; resubscribing')
+                    return
+            if 'Value' not in props:
+                return
             raw = bytes(props['Value'])
             LOG.debug('Notification from %s: %s', path, raw.hex(' '))
             if len(raw) < 2:
